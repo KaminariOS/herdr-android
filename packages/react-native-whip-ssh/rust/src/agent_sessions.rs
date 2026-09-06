@@ -1820,6 +1820,7 @@ mod tests {
             let AgentSessionCore::Codex(core) = &mut session.core else {
                 panic!("expected Codex core");
             };
+            core.bind_source("/rollout".into(), "1:2".into(), 0);
             let _ = core.mark_live_update();
             drop(state);
         }
@@ -1844,6 +1845,7 @@ mod tests {
             let AgentSessionCore::Codex(core) = &mut session.core else {
                 panic!("expected Codex core");
             };
+            core.bind_source("/rollout".into(), "1:2".into(), 0);
             let _ = core.mark_live_update();
             drop(state);
         }

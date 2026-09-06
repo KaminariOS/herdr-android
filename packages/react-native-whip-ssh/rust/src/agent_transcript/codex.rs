@@ -8,6 +8,7 @@ use serde_json::{Map, Value};
 use crate::codex::rollout_wire::{Event as CodexEvent, ResponseItem as CodexResponseItem};
 use crate::codex::{CodexRolloutReducer, RolloutRecord, decode_rollout_record};
 
+use super::history_gate::InitialHistoryGate;
 use super::model::*;
 #[cfg(test)]
 use super::opencode::OpenCodeSessionCore;
@@ -1261,8 +1262,8 @@ pub struct CodexSessionCore {
     framer: TranscriptJsonlFramer,
     cached_lines: Vec<CachedCodexLine>,
     committed_offset: u64,
-    status: AgentTranscriptStatus,
-    error: Option<String>,
+    initial_history_end: Option<u64>,
+    history_gate: InitialHistoryGate,
 }
 
 impl CodexSessionCore {
@@ -1277,8 +1278,8 @@ impl CodexSessionCore {
             framer: TranscriptJsonlFramer::default(),
             cached_lines: Vec::new(),
             committed_offset: 0,
-            status: AgentTranscriptStatus::Loading,
-            error: None,
+            initial_history_end: None,
+            history_gate: InitialHistoryGate::default(),
         }
     }
 
@@ -1299,8 +1300,11 @@ impl CodexSessionCore {
     }
 
     pub fn state(&self) -> AgentTranscriptState {
-        self.adapter
-            .snapshot(self.revision, self.status, self.error.clone())
+        self.adapter.snapshot(
+            self.revision,
+            self.history_gate.status(),
+            self.history_gate.error().map(str::to_owned),
+        )
     }
 
     pub fn mark_stale(&mut self, error: impl Into<String>) -> AgentTranscriptState {
@@ -1309,24 +1313,13 @@ impl CodexSessionCore {
     }
 
     pub fn mark_stale_update(&mut self, error: impl Into<String>) -> AgentTranscriptUpdate {
-        self.status = if self.cached_lines.is_empty() {
-            AgentTranscriptStatus::Error
-        } else {
-            AgentTranscriptStatus::Stale
-        };
-        self.error = Some(error.into());
+        self.history_gate.mark_stale(error);
         self.bump_revision();
         self.status_update()
     }
 
     pub fn mark_restarting_update(&mut self, reason: impl Into<String>) -> AgentTranscriptUpdate {
-        if self.cached_lines.is_empty() {
-            self.status = AgentTranscriptStatus::Loading;
-            self.error = None;
-        } else {
-            self.status = AgentTranscriptStatus::Stale;
-            self.error = Some(reason.into());
-        }
+        self.history_gate.restart(reason);
         self.bump_revision();
         self.status_update()
     }
@@ -1337,20 +1330,13 @@ impl CodexSessionCore {
     }
 
     pub fn mark_unavailable_update(&mut self, error: impl Into<String>) -> AgentTranscriptUpdate {
-        self.status = if self.cached_lines.is_empty() {
-            AgentTranscriptStatus::Unavailable
-        } else {
-            AgentTranscriptStatus::Stale
-        };
-        self.error = Some(error.into());
+        self.history_gate.mark_unavailable(error);
         self.bump_revision();
         self.status_update()
     }
 
     pub fn mark_live(&mut self) -> bool {
-        if self.status != AgentTranscriptStatus::Live || self.error.is_some() {
-            self.status = AgentTranscriptStatus::Live;
-            self.error = None;
+        if self.opening_boundary_reached() && self.history_gate.complete() {
             self.bump_revision();
             true
         } else {
@@ -1369,8 +1355,7 @@ impl CodexSessionCore {
 
     pub fn close_update(&mut self) -> AgentTranscriptUpdate {
         self.source_generation = self.source_generation.saturating_add(1);
-        self.status = AgentTranscriptStatus::Closed;
-        self.error = None;
+        self.history_gate.close();
         self.bump_revision();
         self.status_update()
     }
@@ -1435,8 +1420,10 @@ impl CodexSessionCore {
         self.cached_lines = cached.lines;
         self.adapter = adapter;
         self.revision = revision;
-        self.status = AgentTranscriptStatus::Stale;
-        self.error = None;
+        // A checkpoint can be behind the remote rollout. Keep it hidden until
+        // discovery establishes a boundary and the stream catches up to it.
+        self.initial_history_end = None;
+        self.history_gate.reset();
         self.framer = TranscriptJsonlFramer::with_offset(self.committed_offset);
         self.bump_revision();
         Ok(self.state())
@@ -1497,8 +1484,10 @@ impl CodexSessionCore {
             self.bump_revision();
         }
         self.source = Some(next);
-        self.status = AgentTranscriptStatus::Loading;
-        self.error = None;
+        // Freeze the opening boundary. Later appends must not keep moving the
+        // target while the initial transcript is being prepared for display.
+        self.initial_history_end = Some(remote_size);
+        self.history_gate.reset();
         CodexBindResult {
             source_generation: self.source_generation,
             start_offset: if warm { resume_offset } else { 0 },
@@ -1543,19 +1532,14 @@ impl CodexSessionCore {
             }
         }
         if changed {
-            let status_changed = self.status != AgentTranscriptStatus::Live || self.error.is_some();
-            self.status = AgentTranscriptStatus::Live;
-            self.error = None;
+            let status_changed = self.opening_boundary_reached() && self.history_gate.complete();
             self.bump_revision();
             if reset {
                 deltas = vec![AgentTranscriptDelta::Reset {
                     state: self.state(),
                 }];
             } else if status_changed {
-                deltas.push(AgentTranscriptDelta::StatusChanged {
-                    status: self.status,
-                    error: None,
-                });
+                deltas.push(self.history_gate.status_delta());
             }
         }
         let update = changed.then_some(AgentTranscriptUpdate {
@@ -1572,13 +1556,18 @@ impl CodexSessionCore {
         })
     }
 
+    fn opening_boundary_reached(&self) -> bool {
+        // Called after ingest has processed every complete record in a chunk.
+        // A record still being written at the boundary is live input; waiting
+        // for its newline (or a durable cache cursor) could block opening forever.
+        self.initial_history_end
+            .is_some_and(|end| self.framer.received_offset() >= end)
+    }
+
     fn status_update(&self) -> AgentTranscriptUpdate {
         AgentTranscriptUpdate {
             revision: self.revision,
-            deltas: vec![AgentTranscriptDelta::StatusChanged {
-                status: self.status,
-                error: self.error.clone(),
-            }],
+            deltas: vec![self.history_gate.status_delta()],
         }
     }
 
@@ -2212,6 +2201,176 @@ mod tests {
         assert_eq!(committable, complete.len() as u64);
         assert!(core.confirm_cache(binding.source_generation, committable));
         assert_eq!(core.committed_offset(), complete.len() as u64);
+    }
+
+    #[test]
+    fn initial_history_waits_for_the_opening_boundary_while_new_messages_arrive() {
+        let first = record(
+            "event_msg",
+            serde_json::json!({"type":"user_message","message":"first"}),
+        );
+        let last = record(
+            "event_msg",
+            serde_json::json!({"type":"user_message","message":"last at open"}),
+        );
+        let incoming = record(
+            "event_msg",
+            serde_json::json!({"type":"user_message","message":"arrived later"}),
+        );
+        let mut core = CodexSessionCore::new("thread");
+        let binding = core.bind_source(
+            "/rollout".into(),
+            "1:2".into(),
+            (first.len() + last.len()) as u64,
+        );
+
+        let first_update = core.ingest(binding.source_generation, &first).unwrap();
+        assert!(first_update.changed);
+        assert_eq!(core.state().status, AgentTranscriptStatus::Loading);
+        assert!(core.mark_live_update().is_none());
+
+        // Even a nearly complete final record must be processed before reveal.
+        core.ingest(binding.source_generation, &last[..last.len() - 1])
+            .unwrap();
+        assert_eq!(core.state().status, AgentTranscriptStatus::Loading);
+        assert!(core.mark_live_update().is_none());
+
+        // The next message is already streaming, but does not extend the gate.
+        let update = core
+            .ingest(
+                binding.source_generation,
+                &[&last[last.len() - 1..], &incoming[..incoming.len() / 2]].concat(),
+            )
+            .unwrap()
+            .update
+            .unwrap();
+        assert_eq!(core.state().status, AgentTranscriptStatus::Live);
+        assert!(update.deltas.iter().any(|delta| match delta {
+            AgentTranscriptDelta::Reset { state } => state.status == AgentTranscriptStatus::Live,
+            AgentTranscriptDelta::StatusChanged { status, .. } =>
+                *status == AgentTranscriptStatus::Live,
+            _ => false,
+        }));
+        assert_eq!(
+            text_parts(&core.state(), AgentMessageRole::User),
+            ["first", "last at open"]
+        );
+
+        core.ingest(binding.source_generation, &incoming[incoming.len() / 2..])
+            .unwrap();
+        assert_eq!(core.state().status, AgentTranscriptStatus::Live);
+        assert_eq!(
+            text_parts(&core.state(), AgentMessageRole::User),
+            ["first", "last at open", "arrived later"]
+        );
+    }
+
+    #[test]
+    fn initial_history_can_finish_without_a_visible_record_at_the_boundary() {
+        let first = record(
+            "event_msg",
+            serde_json::json!({"type":"user_message","message":"history"}),
+        );
+        for tail in [
+            b"{\"type\":\"unknown\"}\n".as_slice(),
+            b"not-json\n",
+            b"{\"partial\":",
+        ] {
+            let mut core = CodexSessionCore::new("thread");
+            let binding = core.bind_source(
+                "/rollout".into(),
+                "1:2".into(),
+                (first.len() + tail.len()) as u64,
+            );
+            core.ingest(binding.source_generation, &first).unwrap();
+            assert!(core.mark_live_update().is_none());
+            let result = core.ingest(binding.source_generation, tail).unwrap();
+            assert!(!result.changed);
+            assert!(core.mark_live_update().is_some());
+            assert_eq!(core.state().status, AgentTranscriptStatus::Live);
+            assert_eq!(
+                text_parts(&core.state(), AgentMessageRole::User),
+                ["history"]
+            );
+        }
+    }
+
+    #[test]
+    fn restored_history_waits_for_discovery_and_the_uncached_suffix() {
+        let first = record(
+            "event_msg",
+            serde_json::json!({"type":"user_message","message":"cached"}),
+        );
+        let last = record(
+            "event_msg",
+            serde_json::json!({"type":"user_message","message":"uncached"}),
+        );
+        let mut original = CodexSessionCore::new("thread");
+        let binding = original.bind_source("/rollout".into(), "1:2".into(), first.len() as u64);
+        original.ingest(binding.source_generation, &first).unwrap();
+        let cache = original.cache_blob().unwrap();
+
+        for suffix in [last.as_slice(), b"".as_slice()] {
+            let mut restored = CodexSessionCore::new("thread");
+            let state = restored.restore_cache(&cache).unwrap();
+            assert_eq!(state.status, AgentTranscriptStatus::Loading);
+            assert!(restored.mark_live_update().is_none());
+            restored.mark_restarting_update("Opening Codex transcript");
+            assert_eq!(restored.state().status, AgentTranscriptStatus::Loading);
+            let binding = restored.bind_source(
+                "/rollout".into(),
+                "1:2".into(),
+                (first.len() + suffix.len()) as u64,
+            );
+            assert_eq!(binding.start_offset, first.len() as u64);
+            assert!(!binding.rebuilt);
+            if !suffix.is_empty() {
+                assert!(restored.mark_live_update().is_none());
+                restored.ingest(binding.source_generation, suffix).unwrap();
+            } else {
+                assert!(restored.mark_live_update().is_some());
+            }
+            assert_eq!(restored.state().status, AgentTranscriptStatus::Live);
+            assert_eq!(
+                restored.state().messages.len(),
+                if suffix.is_empty() { 1 } else { 2 }
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_initial_history_cannot_be_revealed_as_stale() {
+        let first = record(
+            "event_msg",
+            serde_json::json!({"type":"user_message","message":"partial history"}),
+        );
+        let mut core = CodexSessionCore::new("thread");
+        let binding = core.bind_source("/rollout".into(), "1:2".into(), first.len() as u64 + 1);
+        core.ingest(binding.source_generation, &first).unwrap();
+        assert_eq!(
+            core.mark_stale("disconnected").status,
+            AgentTranscriptStatus::Error
+        );
+        core.mark_restarting_update("retrying");
+        assert_eq!(core.state().status, AgentTranscriptStatus::Loading);
+        assert_eq!(
+            core.mark_unavailable("missing").status,
+            AgentTranscriptStatus::Unavailable
+        );
+        assert_eq!(
+            text_parts(&core.state(), AgentMessageRole::User),
+            ["partial history"]
+        );
+    }
+
+    #[test]
+    fn empty_initial_history_becomes_live_after_binding() {
+        let mut core = CodexSessionCore::new("thread");
+        assert!(core.mark_live_update().is_none());
+        core.bind_source("/rollout".into(), "1:2".into(), 0);
+        assert!(core.mark_live_update().is_some());
+        assert_eq!(core.state().status, AgentTranscriptStatus::Live);
+        assert!(core.state().turns.is_empty());
     }
 
     #[test]

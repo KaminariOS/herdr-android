@@ -512,7 +512,7 @@ describe('AgentChatView auto-follow', () => {
   });
 });
 
-describe('AgentChatView initial viewport readiness', () => {
+describe.each(['codex', 'opencode'] as const)('AgentChatView initial viewport readiness (%s)', agent => {
   let renderer: ReactTestRenderer;
   let scrollToEnd: jest.Mock;
   let scrollToOffset: jest.Mock;
@@ -531,7 +531,7 @@ describe('AgentChatView initial viewport readiness', () => {
     act(() => {
       renderer = create(
         <AgentChatView
-          agent="codex"
+          agent={agent}
           agentStatus="idle"
           contentInsets={CONTENT_INSETS}
           latestButtonBottom={297}
