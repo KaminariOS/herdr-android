@@ -125,6 +125,71 @@ function openedToken(
 }
 
 describe('Rust-owned agent Chat projection', () => {
+  test('confirmed removal invalidates UI bindings, pending restoration, and late events', async () => {
+    const cache = new MemoryAgentChatCache();
+    await cache.saveNative({ namespace: 'profile', key: transcriptKey, blob: new Uint8Array([1]).buffer });
+    const remote = fakeTransport();
+    const service = new NativeTranscriptService(cache);
+    const token = openedToken(service, remote.value);
+    const removal = service.retainTranscripts({
+      namespace: 'profile', runtimeIncarnation: 1, revision: 2, retainedKeys: [],
+    });
+    remote.emit({
+      revision: 3, deltas: [],
+      cacheWrite: { namespace: 'profile', key: transcriptKey, blob: new Uint8Array([2]).buffer, confirmationToken: 'late' },
+    });
+    await removal;
+    await flush();
+    expect(service.getState(token)).toBeNull();
+    expect(remote.value.startAgentChat).not.toHaveBeenCalled();
+    expect(remote.value.confirmAgentTranscriptCache).not.toHaveBeenCalled();
+    expect(await cache.loadNative(transcriptKey)).toBeNull();
+  });
+
+  test('removal cannot race an already admitted checkpoint back onto disk', async () => {
+    const cache = new MemoryAgentChatCache();
+    const remote = fakeTransport();
+    const service = new NativeTranscriptService(cache);
+    const token = openedToken(service, remote.value);
+    await flush();
+    remote.emit({
+      revision: 2, deltas: [],
+      cacheWrite: { namespace: 'profile', key: transcriptKey, blob: new Uint8Array([1]).buffer, confirmationToken: 'pending' },
+    });
+    await service.retainTranscripts({ namespace: 'profile', runtimeIncarnation: 1, revision: 2, retainedKeys: [] });
+    expect(service.getState(token)).toBeNull();
+    expect(await cache.loadNative(transcriptKey)).toBeNull();
+    expect(remote.value.confirmAgentTranscriptCache).not.toHaveBeenCalled();
+  });
+
+  test('stale snapshots and old runtime callbacks cannot delete current history', async () => {
+    const cache = new MemoryAgentChatCache();
+    const service = new NativeTranscriptService(cache);
+    await cache.saveNative({ namespace: 'profile', key: transcriptKey, blob: new Uint8Array([1]).buffer });
+    await service.retainTranscripts({ namespace: 'profile', runtimeIncarnation: 2, revision: 4, retainedKeys: [transcriptKey] });
+    await service.retainTranscripts({ namespace: 'profile', runtimeIncarnation: 2, revision: 3, retainedKeys: [] });
+    await service.retainTranscripts({ namespace: 'profile', runtimeIncarnation: 1, revision: 99, retainedKeys: [] });
+    expect(await cache.loadNative(transcriptKey)).not.toBeNull();
+  });
+
+  test('local detach preserves history and active shared bindings', async () => {
+    const cache = new MemoryAgentChatCache();
+    const remote = fakeTransport();
+    const service = new NativeTranscriptService(cache);
+    const first = openedToken(service, remote.value);
+    remote.rebind(binding('terminal-2', 'binding-2'));
+    service.activate('host', 'terminal-2', remote.value);
+    await flush();
+    remote.emit({ revision: 2, deltas: [], cacheWrite: {
+      namespace: 'profile', key: transcriptKey, blob: new Uint8Array([1]).buffer, confirmationToken: 'checkpoint',
+    } });
+    service.closeTerminal('host', 'terminal-1', remote.value);
+    await service.retainTranscripts({ namespace: 'profile', runtimeIncarnation: 1, revision: 2, retainedKeys: [transcriptKey] });
+    expect(service.getState(first)).toBeNull();
+    expect(service.getState('binding-2')).not.toBeNull();
+    expect(await cache.loadNative(transcriptKey)).not.toBeNull();
+  });
+
   test('passes only the native binding token and opaque cache back to Rust', async () => {
     const cache = new MemoryAgentChatCache();
     await cache.saveNative({

@@ -4,6 +4,7 @@ import type {
   NativeAgentChatOpenResult,
   NativeAgentTranscriptState,
   NativeAgentTranscriptUpdate,
+  NativeAgentTranscriptRetention,
 } from 'react-native-whip-ssh';
 
 import type { AgentChatState } from '../agentChat';
@@ -53,7 +54,7 @@ interface TranscriptEntry {
   bindings: Map<string, NativeAgentChatBinding>;
   listeners: Map<string, Set<Listener>>;
   state: AgentChatState;
-  persistChain: Promise<void>;
+  deleted: boolean;
 }
 
 export type AgentChatProjection =
@@ -68,6 +69,7 @@ export type AgentChatProjection =
 export class NativeTranscriptService {
   private readonly entries = new Map<string, TranscriptEntry>();
   private readonly terminalBindings = new Map<string, string>();
+  private readonly retentionVersions = new Map<string, NativeAgentTranscriptRetention>();
 
   constructor(private readonly cache: AgentChatCache = agentChatCache) {}
 
@@ -165,7 +167,7 @@ export class NativeTranscriptService {
         bindings: new Map(),
         listeners: new Map(),
         state: activationState,
-        persistChain: Promise.resolve(),
+        deleted: false,
       };
       this.entries.set(entryKey, entry);
     } else {
@@ -236,9 +238,30 @@ export class NativeTranscriptService {
   reset(): void {
     for (const entry of this.entries.values()) {
       for (const listeners of entry.listeners.values()) listeners.clear();
+      entry.bindings.clear();
     }
     this.entries.clear();
     this.terminalBindings.clear();
+  }
+
+  /** Apply Rust's authoritative retention decision without interpreting cache keys. */
+  retainTranscripts(retention: NativeAgentTranscriptRetention): Promise<void> {
+    const previous = this.retentionVersions.get(retention.namespace);
+    if (previous && (previous.runtimeIncarnation > retention.runtimeIncarnation
+      || (previous.runtimeIncarnation === retention.runtimeIncarnation
+        && previous.revision >= retention.revision))) {
+      return Promise.resolve();
+    }
+    this.retentionVersions.set(retention.namespace, retention);
+    const retained = new Set(retention.retainedKeys);
+    for (const entry of this.entries.values()) {
+      if (entry.runtimeIncarnation !== retention.runtimeIncarnation || retained.has(entry.nativeKey)) {
+        continue;
+      }
+      entry.deleted = true;
+      for (const token of [...entry.bindings.keys()]) this.forgetBindingToken(token);
+    }
+    return this.cache.retainNative(retention.namespace, retention.retainedKeys);
   }
 
   private restoreAndStart(
@@ -341,14 +364,17 @@ export class NativeTranscriptService {
     }
     if (!event.cacheWrite) return;
     const checkpoint = event.cacheWrite;
-    entry.persistChain = entry.persistChain
-      .then(async () => {
-        await this.cache.saveNative(checkpoint);
+    // Admit the write immediately to the cache's namespace queue. A deferred
+    // per-entry chain could otherwise enqueue it after authoritative deletion.
+    this.cache.saveNative(checkpoint)
+      .then(() => {
+        if (entry.deleted) return;
         entry.transport.confirmAgentTranscriptCache(
           checkpoint.confirmationToken,
         );
       })
       .catch(error => {
+        if (entry.deleted) return;
         this.publish(entry, {
           ...entry.state,
           status: 'stale',

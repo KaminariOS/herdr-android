@@ -241,6 +241,7 @@ describe('native HostRuntime adapter', () => {
     };
     const rustRuntime = {
       runtimeId: jest.fn(() => 'runtime-1'),
+      runtimeIncarnation: jest.fn(() => 1n),
       connect: jest.fn().mockResolvedValue(undefined),
       disconnect: jest.fn().mockResolvedValue(undefined),
       controlRequest: jest.fn().mockResolvedValue({ tag: 'Ok' }),
@@ -304,6 +305,9 @@ describe('native HostRuntime adapter', () => {
       inner: {
         runtimeId: 'runtime-1',
         state: nativeState,
+        transcriptRetention: {
+          namespace: 'runtime-1', runtimeIncarnation: 1n, revision: 7n, retainedKeys: ['opaque-key'],
+        },
         agentStatusTransitions: [
           {
             paneId: 'p1',
@@ -359,6 +363,9 @@ describe('native HostRuntime adapter', () => {
     expect(handler).toHaveBeenNthCalledWith(3, {
       type: 'host-state',
       state: runtime.hostState(),
+      transcriptRetention: {
+        namespace: 'runtime-1', runtimeIncarnation: 1, revision: 7, retainedKeys: ['opaque-key'],
+      },
       agentStatusTransitions: [
         {
           paneId: 'p1',

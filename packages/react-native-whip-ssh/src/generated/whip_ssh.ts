@@ -1966,8 +1966,20 @@ const FfiConverterTypeAgentTranscriptKind = (() => {
 })();
 
 export enum AgentTranscriptStatus {
+  /**
+   * Initial remote history is not complete yet, even if cached or partial
+   * messages exist. Presentation must wait before preparing the viewport.
+   */
   Loading,
+  /**
+   * History through the boundary captured during opening has been applied.
+   * Presentation may reveal it once the initial viewport is laid out.
+   */
   Live,
+  /**
+   * Previously synchronized history remains usable after a later failure.
+   * Unverified cache data and interrupted initial loads must not use this.
+   */
   Stale,
   Unavailable,
   Error,
@@ -4086,6 +4098,64 @@ const FfiConverterTypeAgentTranscriptEvent = (() => {
         FfiConverterOptionalTypeAgentTranscriptCacheWrite.allocationSize(
           value.cacheWrite,
         )
+      );
+    }
+  }
+  return new FFIConverter();
+})();
+
+/**
+ * Opaque cache identities still present in a fresh authoritative host projection.
+ */
+export type AgentTranscriptRetention = {
+  namespace: string;
+  runtimeIncarnation: bigint;
+  revision: bigint;
+  retainedKeys: Array<string>;
+};
+
+/**
+ * Generated factory for {@link AgentTranscriptRetention} record objects.
+ */
+export const AgentTranscriptRetention = (() => {
+  const defaults = () => ({});
+  const create = (() => {
+    return uniffiCreateRecord<
+      AgentTranscriptRetention,
+      ReturnType<typeof defaults>
+    >(defaults);
+  })();
+  return Object.freeze({
+    create,
+    new: create,
+    defaults: () =>
+      Object.freeze(defaults()) as Partial<AgentTranscriptRetention>,
+  });
+})();
+
+const FfiConverterTypeAgentTranscriptRetention = (() => {
+  type TypeName = AgentTranscriptRetention;
+  class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+    read(from: RustBuffer): TypeName {
+      return {
+        namespace: FfiConverterString.read(from),
+        runtimeIncarnation: FfiConverterUInt64.read(from),
+        revision: FfiConverterUInt64.read(from),
+        retainedKeys: FfiConverterSequenceString.read(from),
+      };
+    }
+    write(value: TypeName, into: RustBuffer): void {
+      FfiConverterString.write(value.namespace, into);
+      FfiConverterUInt64.write(value.runtimeIncarnation, into);
+      FfiConverterUInt64.write(value.revision, into);
+      FfiConverterSequenceString.write(value.retainedKeys, into);
+    }
+    allocationSize(value: TypeName): number {
+      return (
+        FfiConverterString.allocationSize(value.namespace) +
+        FfiConverterUInt64.allocationSize(value.runtimeIncarnation) +
+        FfiConverterUInt64.allocationSize(value.revision) +
+        FfiConverterSequenceString.allocationSize(value.retainedKeys)
       );
     }
   }
@@ -17266,6 +17336,7 @@ export const HostRuntimeEvent = (() => {
       runtimeId: string;
       state: HostStateSnapshot;
       agentStatusTransitions: Array<AgentStatusTransition>;
+      transcriptRetention?: AgentTranscriptRetention;
     }>;
   };
   class HostStateChanged_
@@ -17282,11 +17353,13 @@ export const HostRuntimeEvent = (() => {
       runtimeId: string;
       state: HostStateSnapshot;
       agentStatusTransitions: Array<AgentStatusTransition>;
+      transcriptRetention?: AgentTranscriptRetention;
     }>;
     constructor(inner: {
       runtimeId: string;
       state: HostStateSnapshot;
       agentStatusTransitions: Array<AgentStatusTransition>;
+      transcriptRetention?: AgentTranscriptRetention;
     }) {
       super('HostRuntimeEvent', 'HostStateChanged');
 
@@ -17296,6 +17369,7 @@ export const HostRuntimeEvent = (() => {
       runtimeId: string;
       state: HostStateSnapshot;
       agentStatusTransitions: Array<AgentStatusTransition>;
+      transcriptRetention?: AgentTranscriptRetention;
     }): HostStateChanged_ {
       return new HostStateChanged_(inner);
     }
@@ -17638,6 +17712,8 @@ const FfiConverterTypeHostRuntimeEvent = (() => {
             state: FfiConverterTypeHostStateSnapshot.read(from),
             agentStatusTransitions:
               FfiConverterSequenceTypeAgentStatusTransition.read(from),
+            transcriptRetention:
+              FfiConverterOptionalTypeAgentTranscriptRetention.read(from),
           });
         case 8:
           return new HostRuntimeEvent.LatencyMeasured({
@@ -17740,6 +17816,10 @@ const FfiConverterTypeHostRuntimeEvent = (() => {
           FfiConverterTypeHostStateSnapshot.write(inner.state, into);
           FfiConverterSequenceTypeAgentStatusTransition.write(
             inner.agentStatusTransitions,
+            into,
+          );
+          FfiConverterOptionalTypeAgentTranscriptRetention.write(
+            inner.transcriptRetention,
             into,
           );
           return;
@@ -17863,6 +17943,10 @@ const FfiConverterTypeHostRuntimeEvent = (() => {
           size += FfiConverterSequenceTypeAgentStatusTransition.allocationSize(
             inner.agentStatusTransitions,
           );
+          size +=
+            FfiConverterOptionalTypeAgentTranscriptRetention.allocationSize(
+              inner.transcriptRetention,
+            );
           return size;
         }
         case HostRuntimeEvent_Tags.LatencyMeasured: {
@@ -24966,6 +25050,10 @@ const FfiConverterSequenceTypeAgentStatusTransition = new FfiConverterArray(
   FfiConverterTypeAgentStatusTransition,
 );
 
+// FfiConverter for AgentTranscriptRetention | undefined
+const FfiConverterOptionalTypeAgentTranscriptRetention =
+  new FfiConverterOptional(FfiConverterTypeAgentTranscriptRetention);
+
 // FfiConverter for AgentChatBinding | undefined
 const FfiConverterOptionalTypeAgentChatBinding = new FfiConverterOptional(
   FfiConverterTypeAgentChatBinding,
@@ -26422,6 +26510,7 @@ export default Object.freeze({
     FfiConverterTypeAgentTranscriptKind,
     FfiConverterTypeAgentTranscriptMessage,
     FfiConverterTypeAgentTranscriptPart,
+    FfiConverterTypeAgentTranscriptRetention,
     FfiConverterTypeAgentTranscriptState,
     FfiConverterTypeAgentTranscriptStatus,
     FfiConverterTypeAgentTranscriptTurn,

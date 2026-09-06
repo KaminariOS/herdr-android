@@ -20,6 +20,7 @@ const OPENCODE_POLL_DELAY: Duration = Duration::from_millis(1_200);
 const CODEX_CHECKPOINT_BYTES: u64 = 256 * 1024;
 const OPENCODE_CHECKPOINT_EVENTS: u64 = 64;
 static NEXT_STREAM_CONTEXT: AtomicU64 = AtomicU64::new(1);
+static NEXT_OPERATION_EPOCH: AtomicU64 = AtomicU64::new(1);
 static STREAMS: OnceLock<RwLock<HashMap<u64, StreamContext>>> = OnceLock::new();
 static EVENT_SINK: OnceLock<RwLock<Option<Arc<dyn AgentTranscriptEventSink>>>> = OnceLock::new();
 
@@ -37,6 +38,15 @@ pub struct AgentTranscriptCacheWrite {
     pub key: String,
     pub blob: Vec<u8>,
     pub confirmation_token: String,
+}
+
+/// Opaque cache identities still present in a fresh authoritative host projection.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct AgentTranscriptRetention {
+    pub namespace: String,
+    pub runtime_incarnation: u64,
+    pub revision: u64,
+    pub retained_keys: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
@@ -258,9 +268,11 @@ struct ManagerState {
     next_checkpoint: u64,
     next_binding_generation: u64,
     closed: bool,
+    retention_revision: Option<u64>,
 }
 
 struct AgentSessionManagerInner {
+    reconciliation: Mutex<()>,
     runtime_id: String,
     runtime_incarnation: u64,
     connection: Arc<HerdrConnection>,
@@ -294,6 +306,7 @@ impl AgentSessionManager {
     ) -> Self {
         Self {
             inner: Arc::new(AgentSessionManagerInner {
+                reconciliation: Mutex::new(()),
                 runtime_id,
                 runtime_incarnation,
                 connection,
@@ -305,6 +318,7 @@ impl AgentSessionManager {
                     next_checkpoint: 1,
                     next_binding_generation: 1,
                     closed: false,
+                    retention_revision: None,
                 }),
             }),
         }
@@ -334,7 +348,7 @@ impl AgentSessionManager {
             state.closed = closed;
             let mut emissions = Vec::new();
             for session in state.sessions.values_mut() {
-                session.operation_epoch = session.operation_epoch.saturating_add(1);
+                session.operation_epoch = NEXT_OPERATION_EPOCH.fetch_add(1, Ordering::Relaxed);
                 session.retry_running = false;
                 if let Some(context) = session.stream_context.take() {
                     streams().write().remove(&context);
@@ -390,21 +404,19 @@ impl AgentSessionManager {
         &self,
         identity: AuthoritativeAgentChatIdentity,
     ) -> Result<AgentChatBinding, AgentSessionError> {
+        let _reconciliation = self.inner.reconciliation.lock();
+        self.bind_authoritative_inner(identity)
+    }
+
+    fn bind_authoritative_inner(
+        &self,
+        identity: AuthoritativeAgentChatIdentity,
+    ) -> Result<AgentChatBinding, AgentSessionError> {
         match identity.agent {
             AgentTranscriptKind::Codex => validate_codex_session_id(&identity.session_id)?,
             AgentTranscriptKind::OpenCode => validate_opencode_session_id(&identity.session_id)?,
         }
-        let prefix = match identity.agent {
-            AgentTranscriptKind::Codex => "codex",
-            AgentTranscriptKind::OpenCode => "opencode",
-        };
-        // This is both the native session key and the opaque platform cache
-        // identity. Including the stable HostRuntime id prevents otherwise
-        // identical agent session ids on different hosts from colliding.
-        let key = format!(
-            "{}\n{prefix}\n{}",
-            self.inner.runtime_id, identity.session_id
-        );
+        let key = self.transcript_key(&identity);
         let (binding, state_snapshot, orphaned) = {
             let mut state = self.inner.state.lock();
             if state.closed {
@@ -590,6 +602,11 @@ impl AgentSessionManager {
     }
 
     pub(crate) fn close_terminal(&self, terminal_id: &str) -> Option<String> {
+        let _reconciliation = self.inner.reconciliation.lock();
+        self.close_terminal_inner(terminal_id)
+    }
+
+    fn close_terminal_inner(&self, terminal_id: &str) -> Option<String> {
         let close = {
             let mut state = self.inner.state.lock();
             let binding = state.terminal_bindings.remove(terminal_id)?;
@@ -615,7 +632,7 @@ impl AgentSessionManager {
         if !session.terminals.is_empty() {
             return;
         }
-        session.operation_epoch = session.operation_epoch.saturating_add(1);
+        session.operation_epoch = NEXT_OPERATION_EPOCH.fetch_add(1, Ordering::Relaxed);
         session.retry_running = false;
         session.pending_cache_offset = None;
         if let Some(context) = session.stream_context.take() {
@@ -635,9 +652,19 @@ impl AgentSessionManager {
     pub(crate) fn reconcile_authoritative_bindings(
         &self,
         identities: &HashMap<String, AuthoritativeAgentChatIdentity>,
-    ) {
+        revision: u64,
+    ) -> Option<AgentTranscriptRetention> {
+        let _reconciliation = self.inner.reconciliation.lock();
         let changes = {
-            let state = self.inner.state.lock();
+            let mut state = self.inner.state.lock();
+            if state.closed
+                || state
+                    .retention_revision
+                    .is_some_and(|last| last >= revision)
+            {
+                return None;
+            }
+            state.retention_revision = Some(revision);
             state
                 .terminal_bindings
                 .iter()
@@ -660,13 +687,45 @@ impl AgentSessionManager {
             if let Some(identity) = identity {
                 // `bind_authoritative` replaces the terminal mapping under one
                 // manager lock, then releases an orphaned old transcript.
-                if self.bind_authoritative(identity).is_err() {
-                    self.close_terminal(&terminal_id);
+                if self.bind_authoritative_inner(identity).is_err() {
+                    self.close_terminal_inner(&terminal_id);
                 }
             } else {
-                self.close_terminal(&terminal_id);
+                self.close_terminal_inner(&terminal_id);
             }
         }
+        // Include unopened agents: absence of a local binding is not evidence
+        // that a remote session disappeared. This also reconciles caches from
+        // previous application runs, whose keys are only known to SQLite.
+        let retained: HashSet<_> = identities
+            .values()
+            .map(|identity| self.transcript_key(identity))
+            .collect();
+        let mut state = self.inner.state.lock();
+        state.sessions.retain(|key, _| retained.contains(key));
+        state
+            .checkpoints
+            .retain(|_, checkpoint| retained.contains(&checkpoint.session_key));
+        drop(state);
+        let mut retained_keys: Vec<_> = retained.into_iter().collect();
+        retained_keys.sort_unstable();
+        Some(AgentTranscriptRetention {
+            namespace: self.inner.runtime_id.clone(),
+            runtime_incarnation: self.inner.runtime_incarnation,
+            revision,
+            retained_keys,
+        })
+    }
+
+    fn transcript_key(&self, identity: &AuthoritativeAgentChatIdentity) -> String {
+        let agent = match identity.agent {
+            AgentTranscriptKind::Codex => "codex",
+            AgentTranscriptKind::OpenCode => "opencode",
+        };
+        format!(
+            "{}\n{agent}\n{}",
+            self.inner.runtime_id, identity.session_id
+        )
     }
 
     pub(crate) fn confirm_cache(&self, token: &str) -> bool {
@@ -703,7 +762,7 @@ impl AgentSessionManager {
             if !session.started || session.closed || session.terminals.is_empty() {
                 return;
             }
-            session.operation_epoch = session.operation_epoch.saturating_add(1);
+            session.operation_epoch = NEXT_OPERATION_EPOCH.fetch_add(1, Ordering::Relaxed);
             session.retry_running = false;
             session.pending_cache_offset = None;
             if let Some(context) = session.stream_context.take() {
@@ -1780,6 +1839,96 @@ mod tests {
             manager.state(&first.transcript_key).unwrap().status,
             AgentTranscriptStatus::Closed
         );
+    }
+
+    fn identity(terminal_id: &str, session_id: &str) -> AuthoritativeAgentChatIdentity {
+        AuthoritativeAgentChatIdentity {
+            terminal_id: terminal_id.into(),
+            pane_id: format!("pane-{terminal_id}"),
+            agent: AgentTranscriptKind::Codex,
+            session_id: session_id.into(),
+        }
+    }
+
+    #[test]
+    fn authoritative_retention_preserves_shared_and_unopened_sessions() {
+        let manager = test_manager("host");
+        let first = manager.bind_codex("first".into(), SESSION.into()).unwrap();
+        manager.bind_codex("second".into(), SESSION.into()).unwrap();
+        let unopened = "22222222-2222-4222-8222-222222222222";
+        let identities = HashMap::from([
+            ("second".into(), identity("second", SESSION)),
+            ("unopened".into(), identity("unopened", unopened)),
+        ]);
+        let retention = manager
+            .reconcile_authoritative_bindings(&identities, 2)
+            .unwrap();
+        assert_eq!(
+            retention.retained_keys,
+            vec![
+                first.transcript_key.clone(),
+                format!("host\ncodex\n{unopened}"),
+            ]
+        );
+        assert!(!manager.has_terminal_binding("first"));
+        assert!(manager.has_terminal_binding("second"));
+        assert!(manager.state(&first.transcript_key).is_some());
+        assert!(
+            manager
+                .reconcile_authoritative_bindings(&HashMap::new(), 1)
+                .is_none()
+        );
+        assert!(manager.state(&first.transcript_key).is_some());
+
+        manager.close_terminal("second");
+        manager.reconcile_authoritative_bindings(&identities, 3);
+        assert!(
+            manager.state(&first.transcript_key).is_some(),
+            "local detach preserves history"
+        );
+        let removed = manager
+            .reconcile_authoritative_bindings(&HashMap::new(), 4)
+            .unwrap();
+        assert!(removed.retained_keys.is_empty());
+        assert!(
+            manager.state(&first.transcript_key).is_none(),
+            "remote removal frees retained history"
+        );
+    }
+
+    #[test]
+    fn removal_invalidates_checkpoints_and_callbacks_even_if_session_is_recreated() {
+        let manager = test_manager("host");
+        manager.connected();
+        let first = manager
+            .bind_codex("terminal".into(), SESSION.into())
+            .unwrap();
+        manager.start_bound(&first.binding_token, None).unwrap();
+        let old_epoch = {
+            let mut state = manager.inner.state.lock();
+            state.checkpoints.insert(
+                "pending".into(),
+                PendingCheckpoint {
+                    session_key: first.transcript_key.clone(),
+                    source_generation: 0,
+                    offset: 1,
+                },
+            );
+            state.sessions[&first.transcript_key].operation_epoch
+        };
+        manager.reconcile_authoritative_bindings(&HashMap::new(), 1);
+        assert!(!manager.confirm_cache("pending"));
+        let reopened = manager
+            .bind_codex("terminal".into(), SESSION.into())
+            .unwrap();
+        manager.start_bound(&reopened.binding_token, None).unwrap();
+        let mut state = manager.inner.state.lock();
+        assert!(current_session_mut(&mut state, &reopened.transcript_key, old_epoch).is_none());
+        drop(state);
+        assert!(matches!(
+            manager.start_bound(&first.binding_token, None),
+            Ok(AgentChatStartResult::StaleBinding)
+        ));
     }
 
     #[test]
