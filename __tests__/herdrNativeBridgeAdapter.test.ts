@@ -700,7 +700,7 @@ describe('native HostRuntime adapter', () => {
       runtimeId: jest.fn(() => 'runtime-protocol-mismatch'),
       startHerdrServer: jest.fn().mockRejectedValue({
         tag: 'HerdrProtocolMismatch',
-        inner: { expected: '17–20', received: 21 },
+        inner: { expected: '17–22', received: 23 },
       }),
     };
     mockGenerated.createHostRuntime.mockReturnValueOnce(rustRuntime);
@@ -720,8 +720,8 @@ describe('native HostRuntime adapter', () => {
 
     await expect(runtime.startHerdrServer()).rejects.toMatchObject({
       code: 'HERDR_PROTOCOL_MISMATCH',
-      expected: '17–20',
-      received: 21,
+      expected: '17–22',
+      received: 23,
     });
   });
 
