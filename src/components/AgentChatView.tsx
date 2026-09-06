@@ -754,7 +754,7 @@ const TranscriptTurnView = memo(function TranscriptTurnRow({
     && (tail.part.type === 'text' || tail.part.type === 'reasoning')
     ? tail.part.id
     : undefined;
-  const showThinking = working && turn.status !== 'error' && !parts.length;
+  const showThinking = working && turn.status !== 'error' && streamingPartId === undefined;
   return (
     <View className="w-full">
       {turn.user && <UserPrompt message={turn.user} />}
