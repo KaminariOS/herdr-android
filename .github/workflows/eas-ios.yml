@@ -21,8 +21,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: google-play
-    env:
-      NODE_ENV: production
 
     steps:
       - name: Check out repository
@@ -44,6 +42,8 @@ jobs:
         run: npm ci
 
       - name: Trigger EAS production build
+        env:
+          NODE_ENV: production
         run: >-
           eas build
           --platform ios
