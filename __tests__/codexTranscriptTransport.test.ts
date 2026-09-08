@@ -1,7 +1,7 @@
 import { createHostRuntime, type HostRuntimeLifecycleEvent } from 'react-native-whip-ssh';
 
 import { HerdrClient } from '../src/services/HerdrClient';
-import { agentTranscriptService } from '../src/services/CodexTranscriptService';
+import { agentTranscriptService } from '../src/services/NativeTranscriptService';
 import type { ConnectionProfile } from '../src/types';
 
 jest.mock('react-native-whip-ssh', () =>

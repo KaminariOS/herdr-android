@@ -28,7 +28,7 @@ export type NativeTranscriptTransport = Pick<
   | 'startAgentChat'
 >;
 
-type Listener = (state: AgentChatState) => void;
+type Listener = (state: AgentChatState | null) => void;
 
 function activatingState(state: AgentChatState): AgentChatState {
   return state.status === 'unavailable' || state.status === 'error'
@@ -210,10 +210,14 @@ export class NativeTranscriptService {
     return { type: 'bound', binding, state: entry.state };
   }
 
+  /** Null invalidates only this binding; presentation decides whether to fail. */
   subscribe(bindingToken: string, listener: Listener): () => void {
     const entry = this.entryForBinding(bindingToken);
     const listeners = entry?.listeners.get(bindingToken);
-    if (!entry || !listeners) return () => undefined;
+    if (!entry || !listeners) {
+      listener(null);
+      return () => undefined;
+    }
     listeners.add(listener);
     listener(entry.state);
     return () => listeners.delete(listener);
@@ -309,7 +313,7 @@ export class NativeTranscriptService {
           bindingToken: agentChatDiagnosticToken(binding.bindingToken),
           terminalId: binding.terminalId,
         });
-        this.forgetBindingToken(binding.bindingToken);
+        this.forgetBindingToken(binding.bindingToken, true);
         return;
       }
       recordAgentChatDiagnostic('native-start-finished', {
@@ -404,9 +408,14 @@ export class NativeTranscriptService {
     if (token) this.forgetBindingToken(token);
   }
 
-  private forgetBindingToken(bindingToken: string): void {
+  private forgetBindingToken(bindingToken: string, notify = false): void {
     const entry = this.entryForBinding(bindingToken);
     if (!entry) return;
+    // Invalidation is binding-local, not a transcript/global error. Presentation
+    // decides whether this was a requested operation or a quiet background race.
+    if (notify) {
+      for (const listener of entry.listeners.get(bindingToken) ?? []) listener(null);
+    }
     entry.listeners.get(bindingToken)?.clear();
     entry.listeners.delete(bindingToken);
     entry.bindings.delete(bindingToken);
@@ -435,8 +444,4 @@ export class NativeTranscriptService {
   }
 }
 
-/** @deprecated Agent identity is resolved by Rust; kept as a test-compatible name. */
-export class CodexTranscriptService extends NativeTranscriptService {}
-
 export const agentTranscriptService = new NativeTranscriptService();
-export const codexTranscriptService = agentTranscriptService;

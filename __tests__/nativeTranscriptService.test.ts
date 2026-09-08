@@ -8,13 +8,17 @@ import {
   agentTranscriptReadiness,
   NativeTranscriptService,
   type NativeTranscriptTransport,
-} from '../src/services/CodexTranscriptService';
+} from '../src/services/NativeTranscriptService';
 import { MemoryAgentChatCache } from '../src/services/agentChatCache';
 import {
   AgentChatPresentationPhase,
   requestChatPresentation,
+  chatPresentationLoading,
+  dormantChatPresentation,
   revealPreparedChat,
 } from '../src/lib/agentChatPresentation';
+
+import { chatBindingLost, type AgentChatViewState } from '../src/lib/agentChatReconciliation';
 
 const sessionId = '11111111-1111-4111-8111-111111111111';
 const transcriptKey = `profile\ncodex\n${sessionId}`;
@@ -320,5 +324,52 @@ describe('Rust-owned agent Chat projection', () => {
     expect(projection.type).toBe('no-chat');
     expect(service.getState(token)).toBeNull();
     expect(reconciledPresentation).toBe(AgentChatPresentationPhase.Dormant);
+  });
+});
+
+
+describe.each(['codex', 'opencode'] as const)('%s stale binding presentation', agent => {
+  test.each(['before-subscribe', 'after-subscribe', 'warm-reopen'] as const)('%s invalidation settles an explicit request as failure', async timing => {
+    const remote = fakeTransport(state('loading', 0));
+    remote.rebind({ ...binding(), agent, state: { ...state('loading', 0), agent } });
+    const service = new NativeTranscriptService(new MemoryAgentChatCache());
+    if (timing === 'warm-reopen') {
+      service.activate('host', 'terminal-1', remote.value);
+      await flush();
+    }
+    jest.mocked(remote.value.startAgentChat).mockReturnValue({ type: 'stale-binding' });
+    const opened = service.activate('host', 'terminal-1', remote.value);
+    if (opened.type !== 'bound') throw new Error('Expected native binding');
+    let view: AgentChatViewState = {
+      binding: opened.binding, state: opened.state,
+      presentation: requestChatPresentation(dormantChatPresentation(), 'loading', 1),
+    };
+    expect(chatPresentationLoading(view.presentation)).toBe(true);
+    if (timing === 'before-subscribe') await flush();
+    service.subscribe(opened.binding.bindingToken, update => {
+      if (update === null) view = chatBindingLost(view, false);
+    });
+    await flush();
+    expect(view.presentation.phase).toBe(AgentChatPresentationPhase.Failed);
+    expect(view.state.error).toContain('Try Chat again');
+    expect(chatPresentationLoading(view.presentation)).toBe(false);
+    expect(service.getState(opened.binding.bindingToken)).toBeNull();
+  });
+
+  test('stale background reconciliation remains dormant with no transcript failure', async () => {
+    const remote = fakeTransport(state('loading', 0));
+    remote.rebind({ ...binding(), agent });
+    jest.mocked(remote.value.startAgentChat).mockReturnValue({ type: 'stale-binding' });
+    const service = new NativeTranscriptService(new MemoryAgentChatCache());
+    const projected = service.reconcile('host', 'terminal-1', remote.value);
+    if (projected.type !== 'bound') throw new Error('Expected native binding');
+    let view: AgentChatViewState = { binding: projected.binding, state: projected.state, presentation: dormantChatPresentation() };
+    service.subscribe(projected.binding.bindingToken, update => {
+      if (update === null) view = chatBindingLost(view, false);
+    });
+    await flush();
+    expect(view.presentation.phase).toBe(AgentChatPresentationPhase.Dormant);
+    expect(view.state.error).toBeUndefined();
+    expect(remote.value.openAgentChat).not.toHaveBeenCalled();
   });
 });

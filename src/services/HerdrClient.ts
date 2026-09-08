@@ -20,7 +20,7 @@ import {
   persistHerdrSocketPathHint,
 } from './herdrSocketPathCache';
 import { TerminalBridgeController } from './TerminalBridgeController';
-import { agentTranscriptService } from './CodexTranscriptService';
+import { agentTranscriptService } from './NativeTranscriptService';
 import { reportBackgroundFailure } from './backgroundOperations';
 
 const HOST_KEY_CHALLENGE_CODES = new Set([
