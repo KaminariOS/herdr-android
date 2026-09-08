@@ -2,11 +2,11 @@
 //!
 //! Codex deliberately persists both raw response items and presentation-ready
 //! turn items. Paginated history is driven by `event_msg.item_completed`; the
-//! raw response items remain useful only as a compatibility fallback.
+//! raw response items drive legacy history. Session metadata selects the format.
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Clone, Debug)]
@@ -21,10 +21,43 @@ pub(crate) enum RolloutRecord {
     Unknown { kind: String, value: Value },
 }
 
+/// Selected once from the rollout's first SessionMeta; never from event shapes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CodexHistoryMode {
+    #[default]
+    Unselected,
+    Legacy,
+    Paginated,
+    Unsupported,
+}
+
+impl CodexHistoryMode {
+    fn legacy() -> Self {
+        Self::Legacy
+    }
+
+    fn deserialize_wire<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            Some("legacy") => Self::Legacy,
+            Some("paginated") => Self::Paginated,
+            _ => Self::Unsupported,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct SessionMeta {
     pub id: Option<String>,
     pub cwd: Option<String>,
+    #[serde(
+        default = "CodexHistoryMode::legacy",
+        deserialize_with = "CodexHistoryMode::deserialize_wire"
+    )]
+    pub history_mode: CodexHistoryMode,
 }
 
 #[derive(Clone, Debug)]
@@ -47,7 +80,8 @@ pub(crate) enum Event {
 
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct ItemCompleted {
-    pub thread_id: String,
+    #[serde(rename = "thread_id")]
+    pub _thread_id: String,
     pub turn_id: String,
     pub item: Value,
     #[serde(default)]

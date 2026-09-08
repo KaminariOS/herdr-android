@@ -642,10 +642,12 @@ describe.each(['codex', 'opencode'] as const)('AgentChatView initial viewport re
     const turns = Array.from({ length: 100 }, (_value, index): TranscriptTurn => ({
       assistants: [],
       diffs: [],
-      id: `turn-${index}`,
+      id: `turn-${index + 1}`,
       status: 'idle',
     }));
     renderChat(chatState(turns), onReady);
+    expect(flatList(renderer).props.data.map((turn: TranscriptTurn) => turn.id))
+      .toEqual(Array.from({ length: 100 }, (_value, index) => `turn-${index + 1}`));
     layoutAndMeasure(20_000);
     reportEndReached();
 

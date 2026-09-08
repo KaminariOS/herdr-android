@@ -5,7 +5,11 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::codex::rollout_wire::{Event as CodexEvent, ResponseItem as CodexResponseItem};
+use crate::codex::rollout_reducer::CodexProjectionChanges;
+use crate::codex::rollout_wire::{
+    CodexHistoryMode, Event as CodexEvent, ResponseItem as CodexResponseItem, TurnItem,
+    decode_turn_item,
+};
 use crate::codex::{CodexRolloutReducer, RolloutRecord, decode_rollout_record};
 
 use super::history_gate::InitialHistoryGate;
@@ -13,6 +17,9 @@ use super::model::*;
 #[cfg(test)]
 use super::opencode::OpenCodeSessionCore;
 use super::projection::*;
+
+const UNSUPPORTED_HISTORY_MODE: &str = "Unsupported Codex SessionMeta.history_mode";
+const CODEX_CACHE_SCHEMA_VERSION: u32 = 3;
 
 pub const MAX_TRANSCRIPT_LINE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -188,6 +195,7 @@ pub struct CodexTranscriptAdapter {
     sequence: u64,
     active_user_message_id: Option<String>,
     active_assistant_message_id: Option<String>,
+    history_mode: CodexHistoryMode,
     rollout_reducer: CodexRolloutReducer,
 }
 
@@ -206,6 +214,7 @@ impl CodexTranscriptAdapter {
             sequence: 0,
             active_user_message_id: None,
             active_assistant_message_id: None,
+            history_mode: CodexHistoryMode::Unselected,
             rollout_reducer: CodexRolloutReducer::default(),
         }
     }
@@ -217,14 +226,31 @@ impl CodexTranscriptAdapter {
     fn accept_incremental(&mut self, value: &Value) -> CodexAdapterUpdate {
         let previous_session_id = self.session_id.clone();
         let previous_directory = self.directory.clone();
-        let was_authoritative = self.rollout_reducer.is_authoritative();
         self.sequence = self.sequence.saturating_add(1);
         let decoded = decode_rollout_record(value);
         let record = value.as_object();
         let at = timestamp_ms(record.and_then(|record| record.get("timestamp")));
-        let projection = self.rollout_reducer.accept(&decoded, at, self.sequence);
+        // Later metadata may belong to copied fork history. Only the first header
+        // owns this rollout's projection and identity.
+        let selecting_mode = self.history_mode == CodexHistoryMode::Unselected;
+        if selecting_mode {
+            match &decoded {
+                RolloutRecord::SessionMeta(meta) => self.history_mode = meta.history_mode,
+                RolloutRecord::Unknown { kind, .. } if kind == "session_meta" => {
+                    self.history_mode = CodexHistoryMode::Unsupported;
+                }
+                _ => {}
+            }
+        }
+        let paginated = self.history_mode == CodexHistoryMode::Paginated;
+        let legacy = self.history_mode == CodexHistoryMode::Legacy;
+        let projection = if paginated {
+            self.rollout_reducer.accept(&decoded, at, self.sequence)
+        } else {
+            CodexProjectionChanges::default()
+        };
         let handled = match &decoded {
-            RolloutRecord::SessionMeta(payload) => {
+            RolloutRecord::SessionMeta(payload) if selecting_mode => {
                 if let Some(id) = payload.id.as_ref().filter(|id| !id.is_empty()) {
                     self.session_id.clone_from(id);
                 }
@@ -240,31 +266,43 @@ impl CodexTranscriptAdapter {
                 true
             }
             RolloutRecord::Event(CodexEvent::ItemCompleted(completed)) => {
-                if !completed.thread_id.is_empty() {
-                    self.session_id.clone_from(&completed.thread_id);
+                // Legacy persistence also permits item-only plans. Project supported
+                // content in place without handing the rollout to the paginated reducer.
+                if legacy
+                    && let TurnItem::Plan(plan) = decode_turn_item(completed.item.clone())
+                    && !plan.text.trim().is_empty()
+                {
+                    self.put_part(
+                        AgentTranscriptPart::Plan {
+                            id: plan.id,
+                            text: plan.text,
+                            timestamp_ms: at,
+                        },
+                        at,
+                    );
                 }
                 true
             }
-            RolloutRecord::Event(CodexEvent::Legacy(payload)) => {
+            RolloutRecord::Event(CodexEvent::Legacy(payload)) if legacy => {
                 if let Some(payload) = payload.as_object() {
                     self.accept_event(payload, at);
                 }
                 true
             }
-            RolloutRecord::ResponseItem(CodexResponseItem::Known { value }) => {
+            RolloutRecord::ResponseItem(CodexResponseItem::Known { value }) if legacy => {
                 if let Some(payload) = value.as_object() {
                     self.accept_response(payload, at);
                 }
                 true
             }
             RolloutRecord::Event(CodexEvent::TurnStarted(_)) => {
-                if !self.rollout_reducer.is_authoritative() {
+                if legacy {
                     self.begin_turn();
                 }
                 true
             }
             RolloutRecord::Event(CodexEvent::TurnComplete(_)) => {
-                if !self.rollout_reducer.is_authoritative() {
+                if legacy {
                     if let Some(id) = self.active_assistant_message_id.clone()
                         && let Some(message) = self.message_mut(&id)
                     {
@@ -275,13 +313,13 @@ impl CodexTranscriptAdapter {
                 true
             }
             RolloutRecord::Event(CodexEvent::ThreadRolledBack(rollback)) => {
-                if !self.rollout_reducer.is_authoritative() {
+                if legacy {
                     self.rollback_legacy(rollback.num_turns);
                 }
                 true
             }
             RolloutRecord::Event(CodexEvent::TurnAborted(_)) | RolloutRecord::Compacted(_) => true,
-            RolloutRecord::AppServerLike(value) => {
+            RolloutRecord::AppServerLike(value) if legacy => {
                 if let Some(record) = value.as_object() {
                     match nonempty(record.get("type")) {
                         Some("thread.started") => {
@@ -305,11 +343,19 @@ impl CodexTranscriptAdapter {
                     false
                 }
             }
-            RolloutRecord::KnownIrrelevant
-            | RolloutRecord::Event(CodexEvent::KnownIrrelevant | CodexEvent::Unknown { .. })
-            | RolloutRecord::ResponseItem(CodexResponseItem::Unknown { .. })
+            RolloutRecord::SessionMeta(_)
+            | RolloutRecord::AppServerLike(_)
+            | RolloutRecord::KnownIrrelevant
+            | RolloutRecord::Event(
+                CodexEvent::Legacy(_) | CodexEvent::KnownIrrelevant | CodexEvent::Unknown { .. },
+            )
+            | RolloutRecord::ResponseItem(
+                CodexResponseItem::Known { .. } | CodexResponseItem::Unknown { .. },
+            )
             | RolloutRecord::Unknown { .. } => false,
         };
+        let handled =
+            handled || (selecting_mode && self.history_mode != CodexHistoryMode::Unselected);
         let mut deltas = Vec::new();
         let info_changed =
             previous_session_id != self.session_id || previous_directory != self.directory;
@@ -318,8 +364,9 @@ impl CodexTranscriptAdapter {
                 info: Some(self.info()),
             });
         }
-        let reset = projection.became_authoritative || (!was_authoritative && handled);
-        if self.rollout_reducer.is_authoritative() && !reset {
+        let reset = (selecting_mode && self.history_mode != CodexHistoryMode::Unselected)
+            || (legacy && handled);
+        if paginated && !reset {
             if let Some(length) = projection.messages_truncated_to {
                 deltas.push(AgentTranscriptDelta::MessagesTruncated {
                     length: u32::try_from(length).unwrap_or(u32::MAX),
@@ -365,17 +412,15 @@ impl CodexTranscriptAdapter {
     }
 
     fn projected_messages(&self) -> &[AgentTranscriptMessage] {
-        if self.rollout_reducer.is_authoritative() {
-            self.rollout_reducer.messages()
-        } else {
-            &self.messages
+        match self.history_mode {
+            CodexHistoryMode::Paginated => self.rollout_reducer.messages(),
+            CodexHistoryMode::Legacy => &self.messages,
+            CodexHistoryMode::Unselected | CodexHistoryMode::Unsupported => &[],
         }
     }
 
     fn projected_turns(&self) -> Option<&[AgentTranscriptTurn]> {
-        self.rollout_reducer
-            .is_authoritative()
-            .then(|| self.rollout_reducer.turns())
+        (self.history_mode == CodexHistoryMode::Paginated).then(|| self.rollout_reducer.turns())
     }
 
     #[cfg(test)]
@@ -389,6 +434,14 @@ impl CodexTranscriptAdapter {
         status: AgentTranscriptStatus,
         error: Option<String>,
     ) -> AgentTranscriptState {
+        let (status, error) = if self.history_mode == CodexHistoryMode::Unsupported {
+            (
+                AgentTranscriptStatus::Unavailable,
+                Some(UNSUPPORTED_HISTORY_MODE.to_owned()),
+            )
+        } else {
+            (status, error)
+        };
         let messages = self.projected_messages().to_vec();
         let turns = self
             .projected_turns()
@@ -1218,6 +1271,8 @@ struct CachedCodexSession {
     committed_offset: u64,
     lines: Vec<CachedCodexLine>,
     #[serde(default)]
+    history_mode: Option<CodexHistoryMode>,
+    #[serde(default)]
     revision: Option<u64>,
     #[serde(default)]
     transcript: Option<AgentTranscriptState>,
@@ -1230,6 +1285,7 @@ struct CachedCodexSessionRef<'a> {
     source: Option<&'a CodexSourceIdentity>,
     committed_offset: u64,
     lines: &'a [CachedCodexLine],
+    history_mode: CodexHistoryMode,
     revision: u64,
 }
 
@@ -1336,7 +1392,10 @@ impl CodexSessionCore {
     }
 
     pub fn mark_live(&mut self) -> bool {
-        if self.opening_boundary_reached() && self.history_gate.complete() {
+        if self.adapter.history_mode != CodexHistoryMode::Unsupported
+            && self.opening_boundary_reached()
+            && self.history_gate.complete()
+        {
             self.bump_revision();
             true
         } else {
@@ -1363,7 +1422,7 @@ impl CodexSessionCore {
     pub fn restore_cache(&mut self, bytes: &[u8]) -> Result<AgentTranscriptState, AgentCacheError> {
         let cached: CachedCodexSession = serde_json::from_slice(bytes)
             .map_err(|error| AgentCacheError::Malformed(error.to_string()))?;
-        if !matches!(cached.schema_version, 1 | 2) {
+        if !matches!(cached.schema_version, 1 | 2 | CODEX_CACHE_SCHEMA_VERSION) {
             return Err(AgentCacheError::Malformed("unsupported schema".to_owned()));
         }
         if cached.requested_session_id != self.requested_session_id {
@@ -1389,6 +1448,18 @@ impl CodexSessionCore {
                 adapter.accept(&value);
             }
         }
+        // Old caches contain the raw prefix, so migration also reads SessionMeta.
+        // New caches must agree with that canonical header before resuming a cursor.
+        if cached.schema_version == CODEX_CACHE_SCHEMA_VERSION
+            && cached.history_mode != Some(adapter.history_mode)
+        {
+            return Err(AgentCacheError::ReplayDiverged);
+        }
+        if cached.committed_offset > 0 && adapter.history_mode == CodexHistoryMode::Unselected {
+            return Err(AgentCacheError::Malformed(
+                "cache is missing SessionMeta".to_owned(),
+            ));
+        }
         let revision = if cached.schema_version == 1 {
             let transcript = cached.transcript.as_ref().ok_or_else(|| {
                 AgentCacheError::Malformed("legacy transcript is missing".to_owned())
@@ -1408,7 +1479,7 @@ impl CodexSessionCore {
         } else {
             if cached.transcript.is_some() {
                 return Err(AgentCacheError::Malformed(
-                    "schema 2 duplicated its transcript projection".to_owned(),
+                    "cache duplicated its transcript projection".to_owned(),
                 ));
             }
             cached
@@ -1435,11 +1506,12 @@ impl CodexSessionCore {
             .cached_lines
             .partition_point(|line| line.end_offset <= committable);
         serde_json::to_vec(&CachedCodexSessionRef {
-            schema_version: 2,
+            schema_version: CODEX_CACHE_SCHEMA_VERSION,
             requested_session_id: &self.requested_session_id,
             source: self.source.as_ref(),
             committed_offset: committable,
             lines: &self.cached_lines[..committed_line_count],
+            history_mode: self.adapter.history_mode,
             revision: self.revision,
         })
         .map_err(|error| AgentCacheError::Malformed(error.to_string()))
@@ -1531,8 +1603,13 @@ impl CodexSessionCore {
                 Err(_) => malformed_records += 1,
             }
         }
+        if self.adapter.history_mode == CodexHistoryMode::Unsupported {
+            self.history_gate.mark_unavailable(UNSUPPORTED_HISTORY_MODE);
+        }
         if changed {
-            let status_changed = self.opening_boundary_reached() && self.history_gate.complete();
+            let status_changed = self.adapter.history_mode != CodexHistoryMode::Unsupported
+                && self.opening_boundary_reached()
+                && self.history_gate.complete();
             self.bump_revision();
             if reset {
                 deltas = vec![AgentTranscriptDelta::Reset {
@@ -1567,7 +1644,16 @@ impl CodexSessionCore {
     fn status_update(&self) -> AgentTranscriptUpdate {
         AgentTranscriptUpdate {
             revision: self.revision,
-            deltas: vec![self.history_gate.status_delta()],
+            deltas: vec![
+                if self.adapter.history_mode == CodexHistoryMode::Unsupported {
+                    AgentTranscriptDelta::StatusChanged {
+                        status: AgentTranscriptStatus::Unavailable,
+                        error: Some(UNSUPPORTED_HISTORY_MODE.to_owned()),
+                    }
+                } else {
+                    self.history_gate.status_delta()
+                },
+            ],
         }
     }
 
@@ -1595,6 +1681,20 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn adapter_with_mode(mode: CodexHistoryMode) -> CodexTranscriptAdapter {
+        let mut adapter = CodexTranscriptAdapter::new("thread");
+        adapter.accept(&serde_json::json!({"type":"session_meta","payload":{"history_mode":mode}}));
+        adapter
+    }
+
+    fn legacy_prefix(kind: &str, payload: Value) -> Vec<u8> {
+        [
+            record("session_meta", serde_json::json!({})),
+            record(kind, payload),
+        ]
+        .concat()
     }
 
     fn paginated_fixture() -> &'static [u8] {
@@ -1740,7 +1840,7 @@ mod tests {
     fn oversized_complete_line_does_not_hide_a_following_agent_update() {
         let mut bytes = vec![b'x'; MAX_TRANSCRIPT_LINE_BYTES + 1];
         bytes.push(b'\n');
-        bytes.extend_from_slice(&record(
+        bytes.extend_from_slice(&legacy_prefix(
             "event_msg",
             serde_json::json!({"type":"agent_message","message":"latest"}),
         ));
@@ -1792,7 +1892,7 @@ mod tests {
 
     #[test]
     fn legacy_response_messages_with_distinct_ids_are_not_deduplicated_by_text() {
-        let mut adapter = CodexTranscriptAdapter::new("thread");
+        let mut adapter = adapter_with_mode(CodexHistoryMode::Legacy);
         for value in [
             serde_json::json!({"type":"response_item","payload":{"type":"message","id":"user-1","role":"user","content":[{"type":"input_text","text":"continue"}]}}),
             serde_json::json!({"type":"response_item","payload":{"type":"message","id":"agent-1","role":"assistant","content":[{"type":"output_text","text":"First answer"}]}}),
@@ -1810,7 +1910,7 @@ mod tests {
 
     #[test]
     fn legacy_thread_rollback_removes_the_requested_user_turns() {
-        let mut adapter = CodexTranscriptAdapter::new("thread");
+        let mut adapter = adapter_with_mode(CodexHistoryMode::Legacy);
         for (turn, message) in [("turn-1", "one"), ("turn-2", "two")] {
             adapter.accept(&serde_json::json!({
                 "type":"event_msg","payload":{"type":"task_started","turn_id":turn,"model_context_window":null}
@@ -1832,7 +1932,7 @@ mod tests {
 
     #[test]
     fn reasoning_exposes_summary_but_not_raw_content() {
-        let mut adapter = CodexTranscriptAdapter::new("thread");
+        let mut adapter = adapter_with_mode(CodexHistoryMode::Legacy);
         adapter.accept(&serde_json::json!({"type":"response_item","payload":{"type":"reasoning","id":"r1","summary":[{"text":"Checked the failure."}],"content":[{"text":"hidden chain"}]}}));
         adapter.accept(&serde_json::json!({"type":"event_msg","payload":{"type":"agent_reasoning_raw_content","text":"also hidden"}}));
         let state = adapter.snapshot(1, AgentTranscriptStatus::Live, None);
@@ -1846,6 +1946,330 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(reasoning, ["Checked the failure."]);
+    }
+
+    fn history_header(mode: Option<Value>) -> Vec<u8> {
+        let mut payload = serde_json::json!({"id":"thread","cwd":"/repo"});
+        if let Some(mode) = mode {
+            payload["history_mode"] = mode;
+        }
+        record("session_meta", payload)
+    }
+
+    fn completed_item(turn: usize, item: Value) -> Vec<u8> {
+        record(
+            "event_msg",
+            serde_json::json!({
+                "type":"item_completed", "thread_id":"thread", "turn_id":format!("turn-{turn}"),
+                "item":item, "completed_at_ms":turn
+            }),
+        )
+    }
+
+    fn history_turn(turn: usize, mode: CodexHistoryMode) -> Vec<u8> {
+        let mut bytes = record(
+            "event_msg",
+            serde_json::json!({
+                "type":"task_started", "turn_id":format!("turn-{turn}")
+            }),
+        );
+        match mode {
+            CodexHistoryMode::Paginated => {
+                bytes.extend(completed_item(
+                    turn,
+                    serde_json::json!({
+                        "type":"UserMessage", "id":format!("user-{turn}"),
+                        "content":[{"type":"text", "text":format!("question {turn}")}]
+                    }),
+                ));
+                bytes.extend(completed_item(
+                    turn,
+                    serde_json::json!({
+                        "type":"AgentMessage", "id":format!("answer-{turn}"),
+                        "content":[{"type":"Text", "text":format!("answer {turn}")}]
+                    }),
+                ));
+                // Raw response items can coexist with paginated presentation items.
+                bytes.extend(record(
+                    "response_item",
+                    serde_json::json!({
+                        "type":"message", "role":"assistant", "id":format!("raw-{turn}"),
+                        "content":[{"type":"output_text", "text":"raw duplicate"}]
+                    }),
+                ));
+            }
+            CodexHistoryMode::Legacy => {
+                bytes.extend(record(
+                    "event_msg",
+                    serde_json::json!({
+                        "type":"user_message", "message":format!("question {turn}")
+                    }),
+                ));
+                bytes.extend(record(
+                    "event_msg",
+                    serde_json::json!({
+                        "type":"agent_message", "message":format!("answer {turn}")
+                    }),
+                ));
+                // Upstream legally persists Plan ItemCompleted in legacy rollouts.
+                bytes.extend(completed_item(
+                    turn,
+                    serde_json::json!({
+                        "type":"Plan", "id":format!("plan-{turn}"), "text":"Continue"
+                    }),
+                ));
+            }
+            _ => panic!("test requires a supported history mode"),
+        }
+        bytes.extend(record(
+            "event_msg",
+            serde_json::json!({
+                "type":"task_complete", "turn_id":format!("turn-{turn}")
+            }),
+        ));
+        bytes
+    }
+
+    #[test]
+    fn session_meta_selects_legacy_default_explicit_legacy_and_paginated() {
+        for (wire, mode) in [
+            (None, CodexHistoryMode::Legacy),
+            (Some(serde_json::json!("legacy")), CodexHistoryMode::Legacy),
+            (
+                Some(serde_json::json!("paginated")),
+                CodexHistoryMode::Paginated,
+            ),
+        ] {
+            let mut bytes = history_header(wire);
+            bytes.extend(history_turn(1, mode));
+            // Copied source metadata, even unknown, must not change the projection or identity.
+            bytes.extend(record(
+                "session_meta",
+                serde_json::json!({
+                    "id":"fork-source", "cwd":"/source", "history_mode":"future"
+                }),
+            ));
+            bytes.extend(history_turn(2, mode));
+            let state = parse_codex_chunks(&bytes, 7);
+            assert_eq!(state.session_id, "thread");
+            assert_eq!(
+                state.info.as_ref().unwrap().directory.as_deref(),
+                Some("/repo")
+            );
+            assert_eq!(state.turns.len(), 2);
+            if mode == CodexHistoryMode::Legacy {
+                assert_eq!(
+                    state
+                        .messages
+                        .iter()
+                        .flat_map(|message| &message.parts)
+                        .filter(|part| matches!(part, AgentTranscriptPart::Plan { .. }))
+                        .count(),
+                    2
+                );
+            }
+            assert_eq!(
+                text_parts(&state, AgentMessageRole::User),
+                ["question 1", "question 2"]
+            );
+            assert_eq!(
+                text_parts(&state, AgentMessageRole::Assistant),
+                ["answer 1", "answer 2"]
+            );
+        }
+    }
+
+    #[test]
+    fn paginated_metadata_selects_canonical_turns_before_any_completed_item() {
+        let mut bytes = history_header(Some(serde_json::json!("paginated")));
+        bytes.extend(record(
+            "event_msg",
+            serde_json::json!({"type":"task_started","turn_id":"empty-turn"}),
+        ));
+        let state = parse_codex_chunks(&bytes, 1);
+        assert!(state.messages.is_empty());
+        assert_eq!(state.turns[0].id, "empty-turn");
+        assert_eq!(state.turns[0].status, AgentTurnStatus::Working);
+    }
+
+    #[test]
+    fn unknown_history_modes_fail_closed_through_cache_and_later_metadata() {
+        for mode in [
+            serde_json::json!("future"),
+            Value::Null,
+            serde_json::json!(42),
+            serde_json::json!({}),
+        ] {
+            let mut bytes = history_header(Some(mode));
+            bytes.extend(history_turn(1, CodexHistoryMode::Legacy));
+            bytes.extend(history_turn(2, CodexHistoryMode::Paginated));
+            bytes.extend(history_header(Some(serde_json::json!("legacy"))));
+            let mut core = CodexSessionCore::new("thread");
+            let binding = core.bind_source("/rollout".into(), "1:2".into(), bytes.len() as u64);
+            let update = core
+                .ingest(binding.source_generation, &bytes)
+                .unwrap()
+                .update
+                .unwrap();
+            assert!(
+                matches!(&update.deltas[0], AgentTranscriptDelta::Reset { state }
+                if state.status == AgentTranscriptStatus::Unavailable && state.messages.is_empty())
+            );
+            assert!(!core.mark_live());
+            let mut restored = CodexSessionCore::new("thread");
+            restored.restore_cache(&core.cache_blob().unwrap()).unwrap();
+            let binding = restored.bind_source("/rollout".into(), "1:2".into(), bytes.len() as u64);
+            restored
+                .ingest(
+                    binding.source_generation,
+                    &history_turn(3, CodexHistoryMode::Legacy),
+                )
+                .unwrap();
+            assert_eq!(restored.state().status, AgentTranscriptStatus::Unavailable);
+            assert_eq!(
+                restored.state().error.as_deref(),
+                Some(UNSUPPORTED_HISTORY_MODE)
+            );
+            assert!(restored.state().messages.is_empty());
+            assert!(restored.state().turns.is_empty());
+        }
+    }
+
+    #[test]
+    fn cache_before_the_first_item_restores_paginated_mode() {
+        let header = history_header(Some(serde_json::json!("paginated")));
+        let mut core = CodexSessionCore::new("thread");
+        let binding = core.bind_source("/rollout".into(), "1:2".into(), header.len() as u64);
+        core.ingest(binding.source_generation, &header).unwrap();
+        let mut restored = CodexSessionCore::new("thread");
+        restored.restore_cache(&core.cache_blob().unwrap()).unwrap();
+        let suffix = record(
+            "event_msg",
+            serde_json::json!({"type":"task_started","turn_id":"empty-turn"}),
+        );
+        let binding = restored.bind_source(
+            "/rollout".into(),
+            "1:2".into(),
+            (header.len() + suffix.len()) as u64,
+        );
+        assert_eq!(binding.start_offset, header.len() as u64);
+        let update = restored
+            .ingest(binding.source_generation, &suffix)
+            .unwrap()
+            .update
+            .unwrap();
+        assert!(update.deltas.iter().any(|delta| matches!(delta,
+            AgentTranscriptDelta::TurnUpserted { index: 0, turn } if turn.id == "empty-turn")));
+        assert_eq!(restored.state().turns[0].id, "empty-turn");
+        assert!(restored.state().messages.is_empty());
+    }
+
+    #[test]
+    fn completed_items_cannot_select_a_mode_without_session_meta() {
+        let bytes = history_turn(1, CodexHistoryMode::Paginated);
+        let state = parse_codex_chunks(&bytes, bytes.len());
+        assert!(state.messages.is_empty());
+        assert!(state.turns.is_empty());
+    }
+
+    #[test]
+    fn all_one_hundred_turns_survive_cache_resume_and_incremental_projection() {
+        for (wire, mode) in [
+            (None, CodexHistoryMode::Legacy),
+            (Some(serde_json::json!("legacy")), CodexHistoryMode::Legacy),
+            (
+                Some(serde_json::json!("paginated")),
+                CodexHistoryMode::Paginated,
+            ),
+        ] {
+            let mut bytes = history_header(wire);
+            for turn in 1..=50 {
+                bytes.extend(history_turn(turn, mode));
+            }
+            let mut core = CodexSessionCore::new("thread");
+            let binding = core.bind_source("/rollout".into(), "1:2".into(), bytes.len() as u64);
+            core.ingest(binding.source_generation, &bytes).unwrap();
+            let mut cache: Value = serde_json::from_slice(&core.cache_blob().unwrap()).unwrap();
+            assert_eq!(cache["history_mode"], serde_json::to_value(mode).unwrap());
+            let suffix: Vec<u8> = (51..=100)
+                .flat_map(|turn| history_turn(turn, mode))
+                .collect();
+            // Schema 2 migration derives the mode only from its retained SessionMeta.
+            for schema in [2, CODEX_CACHE_SCHEMA_VERSION] {
+                cache["schema_version"] = serde_json::json!(schema);
+                if schema == 2 {
+                    cache.as_object_mut().unwrap().remove("history_mode");
+                } else {
+                    cache["history_mode"] = serde_json::to_value(mode).unwrap();
+                }
+                let mut restored = CodexSessionCore::new("thread");
+                restored
+                    .restore_cache(&serde_json::to_vec(&cache).unwrap())
+                    .unwrap();
+                assert_eq!(restored.adapter.history_mode, mode);
+                let binding = restored.bind_source(
+                    "/rollout".into(),
+                    "1:2".into(),
+                    (bytes.len() + suffix.len()) as u64,
+                );
+                assert_eq!(binding.start_offset, bytes.len() as u64);
+                for turn in 51..=100 {
+                    let update = restored
+                        .ingest(binding.source_generation, &history_turn(turn, mode))
+                        .unwrap()
+                        .update
+                        .unwrap();
+                    if mode == CodexHistoryMode::Paginated {
+                        assert!(
+                            update
+                                .deltas
+                                .iter()
+                                .all(|delta| !matches!(delta, AgentTranscriptDelta::Reset { .. }))
+                        );
+                    }
+                    assert_eq!(restored.state().turns.len(), turn);
+                }
+                let state = restored.state();
+                assert_eq!(state.turns.len(), 100);
+                assert_eq!(
+                    text_parts(&state, AgentMessageRole::User),
+                    (1..=100)
+                        .map(|turn| format!("question {turn}"))
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    text_parts(&state, AgentMessageRole::Assistant),
+                    (1..=100)
+                        .map(|turn| format!("answer {turn}"))
+                        .collect::<Vec<_>>()
+                );
+                let full = parse_codex_chunks(&[bytes.clone(), suffix.clone()].concat(), 17);
+                assert_eq!(state.messages, full.messages);
+                assert_eq!(state.turns, full.turns);
+            }
+        }
+    }
+
+    #[test]
+    fn cache_rejects_a_mode_that_disagrees_with_canonical_metadata() {
+        let bytes = history_header(Some(serde_json::json!("paginated")));
+        let mut core = CodexSessionCore::new("thread");
+        let binding = core.bind_source("/rollout".into(), "1:2".into(), bytes.len() as u64);
+        core.ingest(binding.source_generation, &bytes).unwrap();
+        let cache: Value = serde_json::from_slice(&core.cache_blob().unwrap()).unwrap();
+        for mode in [
+            Value::Null,
+            serde_json::json!("legacy"),
+            serde_json::json!("future"),
+        ] {
+            let mut invalid = cache.clone();
+            invalid["history_mode"] = mode;
+            assert!(
+                CodexSessionCore::new("thread")
+                    .restore_cache(&serde_json::to_vec(&invalid).unwrap())
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -1993,7 +2417,7 @@ mod tests {
 
     #[test]
     fn current_thread_rollback_removes_materialized_turns_and_messages() {
-        let mut adapter = CodexTranscriptAdapter::new("thread");
+        let mut adapter = adapter_with_mode(CodexHistoryMode::Paginated);
         for index in 1..=3 {
             let turn_id = format!("turn-{index}");
             adapter.accept(&serde_json::json!({
@@ -2031,7 +2455,7 @@ mod tests {
 
     #[test]
     fn unknown_current_records_are_counted_and_do_not_break_projection() {
-        let mut adapter = CodexTranscriptAdapter::new("thread");
+        let mut adapter = adapter_with_mode(CodexHistoryMode::Paginated);
         adapter.accept(&serde_json::json!({"type":"future_rollout","payload":{}}));
         adapter.accept(&serde_json::json!({"type":"event_msg","payload":{"type":"future_event"}}));
         adapter.accept(&serde_json::json!({
@@ -2052,7 +2476,7 @@ mod tests {
 
     #[test]
     fn tool_search_output_completes_the_matching_legacy_tool() {
-        let mut adapter = CodexTranscriptAdapter::new("thread");
+        let mut adapter = adapter_with_mode(CodexHistoryMode::Legacy);
         adapter.accept(&serde_json::json!({
             "type":"response_item",
             "payload":{"type":"tool_search_call","id":"search-item","call_id":"search-call","status":"in_progress","execution":"search_tools","arguments":{"query":"calendar"}}
@@ -2078,7 +2502,7 @@ mod tests {
 
     #[test]
     fn current_turn_completion_error_marks_the_canonical_turn_failed() {
-        let mut adapter = CodexTranscriptAdapter::new("thread");
+        let mut adapter = adapter_with_mode(CodexHistoryMode::Paginated);
         adapter.accept(&serde_json::json!({
             "type":"event_msg",
             "payload":{"type":"task_started","turn_id":"turn-error","model_context_window":null}
@@ -2102,7 +2526,7 @@ mod tests {
 
     #[test]
     fn tool_lifecycle_retains_stable_identity() {
-        let mut adapter = CodexTranscriptAdapter::new("thread");
+        let mut adapter = adapter_with_mode(CodexHistoryMode::Legacy);
         adapter.accept(&serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_1","name":"exec","input":{"cmd":"git status"}}}));
         adapter.accept(&serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_1","output":"clean"}}));
         let state = adapter.snapshot(1, AgentTranscriptStatus::Live, None);
@@ -2136,7 +2560,7 @@ mod tests {
         .concat();
         let parse = |chunks: Vec<&[u8]>| {
             let mut framer = TranscriptJsonlFramer::default();
-            let mut adapter = CodexTranscriptAdapter::new("thread");
+            let mut adapter = adapter_with_mode(CodexHistoryMode::Legacy);
             for chunk in chunks {
                 for line in framer.push(chunk).unwrap() {
                     if let Ok(value) = line.parsed
@@ -2188,7 +2612,7 @@ mod tests {
     fn checkpoint_advances_only_after_explicit_durable_confirmation() {
         let mut core = CodexSessionCore::new("thread");
         let binding = core.bind_source("/rollout".into(), "1:2".into(), 0);
-        let complete = record(
+        let complete = legacy_prefix(
             "event_msg",
             serde_json::json!({"type":"user_message","message":"one"}),
         );
@@ -2205,7 +2629,7 @@ mod tests {
 
     #[test]
     fn initial_history_waits_for_the_opening_boundary_while_new_messages_arrive() {
-        let first = record(
+        let first = legacy_prefix(
             "event_msg",
             serde_json::json!({"type":"user_message","message":"first"}),
         );
@@ -2267,7 +2691,7 @@ mod tests {
 
     #[test]
     fn initial_history_can_finish_without_a_visible_record_at_the_boundary() {
-        let first = record(
+        let first = legacy_prefix(
             "event_msg",
             serde_json::json!({"type":"user_message","message":"history"}),
         );
@@ -2297,7 +2721,7 @@ mod tests {
 
     #[test]
     fn restored_history_waits_for_discovery_and_the_uncached_suffix() {
-        let first = record(
+        let first = legacy_prefix(
             "event_msg",
             serde_json::json!({"type":"user_message","message":"cached"}),
         );
@@ -2340,7 +2764,7 @@ mod tests {
 
     #[test]
     fn interrupted_initial_history_cannot_be_revealed_as_stale() {
-        let first = record(
+        let first = legacy_prefix(
             "event_msg",
             serde_json::json!({"type":"user_message","message":"partial history"}),
         );
@@ -2390,7 +2814,7 @@ mod tests {
         let changed = core
             .ingest(
                 binding.source_generation,
-                &record(
+                &legacy_prefix(
                     "event_msg",
                     serde_json::json!({"type":"user_message","message":"visible"}),
                 ),
@@ -2460,7 +2884,7 @@ mod tests {
 
     #[test]
     fn cache_round_trip_replays_raw_lines_and_resumes_incrementally() {
-        let first = record(
+        let first = legacy_prefix(
             "event_msg",
             serde_json::json!({"type":"user_message","message":"one"}),
         );
@@ -2514,7 +2938,7 @@ mod tests {
 
     #[test]
     fn codex_cache_keeps_schema_and_serializes_only_the_complete_prefix() {
-        let complete = record(
+        let complete = legacy_prefix(
             "event_msg",
             serde_json::json!({"type":"user_message","message":"cached"}),
         );
@@ -2529,11 +2953,15 @@ mod tests {
 
         let blob = core.cache_blob().unwrap();
         let cached: CachedCodexSession = serde_json::from_slice(&blob).unwrap();
-        assert_eq!(cached.schema_version, 2);
-        assert_eq!(cached.lines.len(), 1);
+        assert_eq!(cached.schema_version, CODEX_CACHE_SCHEMA_VERSION);
+        assert_eq!(cached.lines.len(), 2);
         assert_eq!(
-            cached.lines[0].raw_line,
-            std::str::from_utf8(&complete).unwrap().trim_end()
+            cached.lines[1].raw_line,
+            std::str::from_utf8(&complete)
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap()
         );
         assert_eq!(cached.committed_offset, complete.len() as u64);
         assert_eq!(cached.revision, Some(core.revision()));
@@ -2545,6 +2973,7 @@ mod tests {
             source: core.source.clone(),
             committed_offset: cached.committed_offset,
             lines: cached.lines,
+            history_mode: None,
             revision: None,
             transcript: Some(core.state()),
         })
@@ -2591,7 +3020,7 @@ mod tests {
 
     #[test]
     fn reconnect_before_cache_confirmation_does_not_replay_incorporated_records() {
-        let first = record(
+        let first = legacy_prefix(
             "event_msg",
             serde_json::json!({"type":"user_message","message":"one"}),
         );
@@ -2608,7 +3037,7 @@ mod tests {
 
     #[test]
     fn replacement_truncation_and_stale_generation_are_isolated() {
-        let first = record(
+        let first = legacy_prefix(
             "event_msg",
             serde_json::json!({"type":"user_message","message":"old"}),
         );
@@ -2631,7 +3060,7 @@ mod tests {
 
     #[test]
     fn transient_failure_retains_cached_transcript() {
-        let first = record(
+        let first = legacy_prefix(
             "event_msg",
             serde_json::json!({"type":"user_message","message":"offline"}),
         );

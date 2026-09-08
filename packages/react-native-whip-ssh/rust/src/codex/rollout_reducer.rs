@@ -1,7 +1,6 @@
 //! Projection of current persisted Codex rollout records into Whip's neutral
-//! transcript model. This reducer is authoritative once a paginated
-//! `item_completed` record is observed; older response/event streams continue
-//! through the legacy adapter.
+//! transcript model. Only rollouts whose SessionMeta selects paginated history
+//! enter this reducer; legacy streams continue through the legacy adapter.
 
 use std::collections::HashMap;
 
@@ -38,7 +37,6 @@ pub(crate) struct CodexRolloutReducer {
     turn_indexes: HashMap<String, usize>,
     active_turn_id: Option<String>,
     context_turn_id: Option<String>,
-    saw_paginated_item: bool,
     drift: ProtocolDriftCounters,
     dirty_messages: Vec<usize>,
     dirty_turns: Vec<usize>,
@@ -48,7 +46,6 @@ pub(crate) struct CodexRolloutReducer {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CodexProjectionChanges {
-    pub(crate) became_authoritative: bool,
     pub(crate) message_indexes: Vec<usize>,
     pub(crate) turn_indexes: Vec<usize>,
     pub(crate) messages_truncated_to: Option<usize>,
@@ -56,10 +53,6 @@ pub(crate) struct CodexProjectionChanges {
 }
 
 impl CodexRolloutReducer {
-    pub(crate) fn is_authoritative(&self) -> bool {
-        self.saw_paginated_item
-    }
-
     pub(crate) fn messages(&self) -> &[AgentTranscriptMessage] {
         &self.messages
     }
@@ -74,7 +67,6 @@ impl CodexRolloutReducer {
         at: Option<u64>,
         sequence: u64,
     ) -> CodexProjectionChanges {
-        let was_authoritative = self.saw_paginated_item;
         match record {
             RolloutRecord::Event(event) => self.accept_event(event, at),
             RolloutRecord::TurnContext(context) => {
@@ -101,16 +93,15 @@ impl CodexRolloutReducer {
             | RolloutRecord::AppServerLike(_)
             | RolloutRecord::KnownIrrelevant => {}
         }
-        self.take_changes(!was_authoritative && self.saw_paginated_item)
+        self.take_changes()
     }
 
-    fn take_changes(&mut self, became_authoritative: bool) -> CodexProjectionChanges {
+    fn take_changes(&mut self) -> CodexProjectionChanges {
         self.dirty_messages.sort_unstable();
         self.dirty_messages.dedup();
         self.dirty_turns.sort_unstable();
         self.dirty_turns.dedup();
         CodexProjectionChanges {
-            became_authoritative,
             message_indexes: std::mem::take(&mut self.dirty_messages),
             turn_indexes: std::mem::take(&mut self.dirty_turns),
             messages_truncated_to: self.messages_truncated_to.take(),
@@ -181,7 +172,6 @@ impl CodexRolloutReducer {
     }
 
     fn accept_item_completed(&mut self, completed: &ItemCompleted) {
-        self.saw_paginated_item = true;
         let started_at = nonzero_millis(completed.started_at_ms);
         let completed_at = nonzero_millis(Some(completed.completed_at_ms));
         let turn_index = self.ensure_turn(&completed.turn_id);

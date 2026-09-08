@@ -1,6 +1,6 @@
 import type { NativeAgentTranscriptState } from 'react-native-whip-ssh';
 
-import { agentChatStateFromNative } from '../src/lib/nativeAgentTranscript';
+import { agentChatStateFromNative, applyNativeAgentTranscriptUpdate } from '../src/lib/nativeAgentTranscript';
 
 test('keeps normalized native tool fields typed through the presentation boundary', () => {
   const tool = {
@@ -75,4 +75,37 @@ test('preserves a closed native transcript as a recoverable terminal state', () 
   };
 
   expect(agentChatStateFromNative(native).status).toBe('closed');
+});
+
+test('keeps Codex turns 1 through 100 available after incremental native updates', () => {
+  let state = agentChatStateFromNative({
+    sessionId: 'codex-history', agent: 'codex', revision: 0, status: 'live',
+    messages: [], turns: [],
+  });
+  for (let index = 0; index < 100; index += 1) {
+    const number = index + 1;
+    const message = {
+      id: `user-${number}`, role: 'user' as const,
+      parts: [{ type: 'text' as const, id: `text-${number}`, text: `question ${number}` }],
+      diffs: [],
+    };
+    const next = applyNativeAgentTranscriptUpdate(state, {
+      key: "host\ncodex\ncodex-history", runtimeIncarnation: 1, revision: number,
+      deltas: [
+        { type: 'message-upserted', index, message },
+        { type: 'turn-upserted', index, turn: {
+          id: `turn-${number}`, userMessageId: message.id,
+          assistantMessageIds: [], status: 'idle', diffs: [],
+        } },
+      ],
+    });
+    expect(next).not.toBeNull();
+    state = next!;
+    expect(state.transcript.turns).toHaveLength(number);
+  }
+  expect(state.transcript.turns.map(turn => ({ id: turn.id, text: turn.user?.parts[0] })))
+    .toEqual(Array.from({ length: 100 }, (_value, index) => ({
+      id: `turn-${index + 1}`,
+      text: { type: 'text', id: `text-${index + 1}`, text: `question ${index + 1}` },
+    })));
 });
