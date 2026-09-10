@@ -44,7 +44,7 @@
     "babel-preset-expo": "~57.0.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
-    "expo": "~57.0.20",
+    "expo": "~57.0.21",
     "expo-application": "~57.0.2",
     "expo-asset": "~57.0.16",
     "expo-audio": "~57.0.3",
