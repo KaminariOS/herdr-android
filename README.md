@@ -10,8 +10,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/KaminariOS/whip/actions/workflows/ci.yml"><img src="https://github.com/KaminariOS/whip/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
-  <a href="https://github.com/KaminariOS/whip/actions/workflows/codeql.yml"><img src="https://github.com/KaminariOS/whip/actions/workflows/codeql.yml/badge.svg" alt="CodeQL status"></a>
+  <a href="https://github.com/kosumic/whip/actions/workflows/ci.yml"><img src="https://github.com/kosumic/whip/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+  <a href="https://github.com/kosumic/whip/actions/workflows/codeql.yml"><img src="https://github.com/kosumic/whip/actions/workflows/codeql.yml/badge.svg" alt="CodeQL status"></a>
   <a href="https://expo.dev"><img src="https://img.shields.io/badge/React%20Native%20%2B%20Expo-000020?logo=expo&amp;logoColor=white" alt="Built with React Native and Expo"></a>
   <a href="#ios"><img src="https://img.shields.io/badge/iOS-unsigned%20build-blue?logo=apple&amp;logoColor=white" alt="Unsigned iOS build available"></a>
 </p>
@@ -162,7 +162,7 @@ Chat View is currently available for active OpenCode and Codex panes. Tap the bo
 
 The recommended installation is through the [Google Play Early Access program](https://play.google.com/store/apps/details?id=io.github.kaminarios.whip). Before using the Google Play link, join the [Whip Community](https://groups.google.com/g/whip-community) and wait a moment for membership to propagate.
 
-Signed ARM64 APKs are also published as normal latest releases on [GitHub Releases](https://github.com/KaminariOS/whip/releases). They use the project's existing release key and include a SHA-256 checksum alongside the APK.
+Signed ARM64 APKs are also published as normal latest releases on [GitHub Releases](https://github.com/kosumic/whip/releases). They use the project's existing release key and include a SHA-256 checksum alongside the APK.
 
 1. Read the [security policy](SECURITY.md) and [privacy notes](PRIVACY.md).
 2. Install through Google Play, or download `whip-arm64.apk` and its checksum from the latest GitHub release.
@@ -190,7 +190,7 @@ host, run the pairing helper with any one of these package managers:
 
 ```bash
 # Nix (GitHub flake)
-nix run github:KaminariOS/whip#whipair
+nix run github:kosumic/whip#whipair
 
 # uv
 uvx whipair
@@ -443,7 +443,7 @@ TurboModule; there is no legacy or second SSH native fallback.
 ## Community
 
 - Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
-- Ask usage and design questions in [GitHub Discussions](https://github.com/KaminariOS/whip/discussions).
+- Ask usage and design questions in [GitHub Discussions](https://github.com/kosumic/whip/discussions).
 - Use the issue forms for reproducible bugs and scoped feature requests.
 - Follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 - Review the [roadmap](ROADMAP.md) for current priorities.

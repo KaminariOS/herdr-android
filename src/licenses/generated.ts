@@ -481,7 +481,7 @@ export const GENERATED_OPEN_SOURCE_LICENSES = [
     id: "npm-react-native-whip-ssh-0-1-0",
     category: "npm",
     projectName: "react-native-whip-ssh",
-    sourceUrl: "https://github.com/kaminarios/whip",
+    sourceUrl: "https://github.com/kosumic/whip",
     attribution: "Direct npm dependency · version 0.1.0",
     licenseName: "AGPL-3.0-or-later",
     licenseAsset: require("../../assets/licenses/generated/0531b39424321b06.txt"),
